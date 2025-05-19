@@ -11,10 +11,10 @@ i = 1
 s = 'Normal'
 
 Read_Data = 'No'
-fname = 'Simulation_Scan_Normal.txt'
+fname = 'Simulation_Scan_Normal_Zero.txt'
 
 # Fluid & probe params
-eta = TP.eta * TP.density
+eta = TP.eta
 D = TP.D
 R = TP.R
 Fn = TP.Fn
@@ -32,7 +32,7 @@ if Make_one_simulation == 'Yes':
     Amp, Freq_test, QFactor = TF.Scan(F_drive, D, i, s)
 
     # output file
-    outname = f"Simulation_Scan_{s}_i_{i}_Number_of_D_{len(D)}_of_F_{len(F_drive)}.TXT"
+    outname = f"Simulation_Scan_{eta}_{s}_i_{i}_Number_of_D_{len(D)}_of_F_{len(F_drive)}.TXT"
     with open(outname, 'w') as f:
         f.write('D [mm], Frequency[Hz], test Frequency, Amplitude Scan, Quality factor\n')
         for idx_d, d in enumerate(D):

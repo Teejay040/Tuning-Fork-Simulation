@@ -37,116 +37,150 @@ def Scan(Freq, Dist, i, s):
     Scan over distances Dist and drive frequencies Freq.
     i = simulation case (1–4), s = 'Normal' or 'Shear'.
     Returns: [amplitude_list, frequency_list, Q_list]
+
+    Damping now has two pieces:
+      • γ_sys = TP.gamma_sys            (distance‐independent)
+      • γ_visc = π·R²·η / D             (distance‐dependent, geometry)
+      → total_gamma = γ_sys + γ_visc
+    Assumes:
+      - TP.R is probe radius in mm
+      - Dist entries are in mm
+      - TP.eta is dynamic viscosity in Pa·s
     """
+
+    import numpy as np
+    from scipy.integrate import odeint
+    from scipy.signal import find_peaks
+    from numpy.fft import fft, fftfreq
+    import TuningFork_Simulation_Parameters as TP
+
+    # System constants
+    K0        = TP.K0             # fork stiffness (N/m)
+    gamma_sys = TP.gamma_sys      # systemic damping [1/s]
+    eta       = TP.eta            # viscosity [Pa·s]
+    phase     = TP.phase
+    amp_noise = TP.Amplitude_noise
+
+    # Probe geometry: convert mm → m
+    R_m = TP.R * 1e-3
+
+    # Choose resonance & drive amplitude
+    if s == "Shear":
+        omega_0 = 2*np.pi * TP.Fs_0 # is this conversion necassery? gives omega ~5000
+        a_drive = TP.As
+    else:
+        omega_0 = 2*np.pi * TP.Fn_0
+        a_drive = TP.An
+
     amplitude_list = []
     frequency_list = []
-    Q_list = []
-
-    # Select resonant omega
-    if s == "Shear":
-        omega_0 = omega_0_S
-    elif s == "Normal":
-        omega_0 = omega_0_N
-    else:
-        raise ValueError("Mode s must be 'Shear' or 'Normal'")
-
-    phase = TP.phase
-    amplitude_noise = TP.Amplitude_noise
+    Q_list         = []
 
     for d in Dist:
-        print(f"Processing distance: {d}")
-        n_omega = len(Freq)
-        TF_array = np.zeros(n_omega)
-        Test_omega_array = np.zeros(n_omega)
-        K = 1.0 / d
-        damp = 1.0 / d
+        print(f"Distance = {d} mm")
+        # convert gap mm → m
+        d_m = d * 1e-3
 
-        for n, freq_val in enumerate(Freq):
-            print(f"  Frequency: {freq_val}")
-            omega_n = 2 * np.pi * freq_val
-            n_period = 8000
-            n_points = 100
-            t = np.linspace(1 / freq_val, n_period / freq_val, (n_period - 1) * n_points)
+        # compute viscous damping for this gap
+        gamma_visc = np.pi * R_m**2 * eta / d_m
+        total_gamma = gamma_sys + gamma_visc
+        # odeint uses damp = total_gamma/2 so that -2*damp*v = -total_gamma*v
+        damp = total_gamma / 2.0
+
+        # constant stiffness
+        K = K0
+
+        TF_array        = np.zeros(len(Freq))
+        Test_omega_array = np.zeros(len(Freq))
+
+        for n, f_drive in enumerate(Freq):
+            print(f"  Drive freq: {f_drive} Hz")
+            ω_drive = 2*np.pi * f_drive
+
+            # time array
+            n_period, n_points = 8000, 100
+            t = np.linspace(1/f_drive,
+                            n_period/f_drive,
+                            (n_period-1)*n_points)
             dt = t[1] - t[0]
 
-            # Drive amplitude and displacement
-            a = An if s == "Normal" else As
-            h_0 = calcX(a, freq_val) * 1e3  # μm
+            # drive displacement amplitude (μm → code units)
+            h0 = ((a_drive * np.sqrt(2) * 9.80665e9)
+                  /(0.22*(2*np.pi*f_drive)**2)) * 1e3
 
-            # Precompute distance-to-surface array (optional)
-            H_array = d + h_0 * np.cos(omega_n * t + phase)
-            H_array[H_array < 0] = 0
-
-            def H_func(tt):
-                return d + h_0 * np.cos(omega_n * tt + phase)
-
-            def H_dot(tt):
-                return -omega_n * h_0 * np.sin(omega_n * tt + phase)
-
+            # noise if needed
             noise = None
-            if i in (2, 3):
-                noise = amplitude_noise * np.random.normal(0, 1, len(t))
+            if i in (2,3):
+                noise = amp_noise * np.random.normal(size=len(t))
 
+            # ODE RHS
             def rhs(y, tt):
-                h = h_0 * np.cos(omega_n * tt + phase)
+                h_t = h0 * np.cos(ω_drive*tt + phase)
+
                 if i == 1:
-                    return [y[1], K*h - 2*damp*y[1] - omega_0**2*y[0]]
+                    accel = K*h_t - total_gamma*y[1] - omega_0**2 * y[0]
+
                 elif i == 2:
-                    idx = min(int((tt - t[0]) / dt), len(noise)-1)
-                    return [y[1], K*h - 2*damp*(1+noise[idx])*y[1] - omega_0**2*y[0]]
+                    idx = min(int((tt - t[0])/dt), len(noise)-1)
+                    accel = (K*h_t
+                             - total_gamma*(1+noise[idx])*y[1]
+                             - omega_0**2 * y[0])
+
                 elif i == 3:
-                    idx = min(int((tt - t[0]) / dt), len(noise)-1)
-                    return [y[1], K*h - 2*damp*y[1] - omega_0**2*(1+noise[idx])*y[0]]
+                    idx = min(int((tt - t[0])/dt), len(noise)-1)
+                    accel = (K*h_t
+                             - total_gamma*y[1]
+                             - omega_0**2*(1+noise[idx])*y[0])
+
                 elif i == 4:
-                    x = np.linspace(0, tt, 10)
-                    f_int = (H_dot(x) / H_func(x)**2) * np.exp((tt - x) / L1)
-                    M_val = (1 - L2/L1) * H_func(tt)**2 / (L1*H_dot(tt)) * trapz(f_int, x) + L2/L1
-                    return [y[1], K*h - 2*damp*M_val*y[1] - omega_0**2*y[0]]
+                    # memory‐kernel branch unchanged
+                    x = np.linspace(0, tt, 100)
+                    H = lambda tt: d + h0*np.cos(ω_drive*tt + phase)
+                    Hd = lambda tt: -ω_drive*h0*np.sin(ω_drive*tt + phase)
+                    f_int = (Hd(x)/H(x)**2) * np.exp((tt-x)/TP.L1)
+                    M = ((1 - TP.L2/TP.L1)*H(tt)**2
+                         /(TP.L1*Hd(tt))*trapz(f_int, x)
+                         + TP.L2/TP.L1)
+                    accel = (K*h_t
+                             - 2*damp*M*y[1]
+                             - omega_0**2*y[0])
                 else:
                     raise ValueError("Invalid simulation case i")
 
-            # Initial conditions
-            y0 = [K*h_0, K*h_0/dt]
+                return [y[1], accel]
+
+            # initial conditions & solve
+            y0  = [K*h0, K*h0/dt]
             sol = odeint(rhs, y0, t)
-            y_sol = sol[:, 0]
+            y_sol = sol[:,0]
 
-            # Remove transient for cases 1–3
+            # trim transients if not case 4
             if i != 4:
-                t_trunc = t[-100*n_points-1:]
-                y_sol = y_sol[-100*n_points-1:]
-                t_sol = t_trunc - t_trunc[0]
-            else:
-                t_sol = t
+                cut = -100*n_points - 1
+                y_sol = y_sol[cut:]
+            # FFT & peak pick
+            X     = fft(y_sol)
+            freqs = fftfreq(len(y_sol), d=dt)
+            Npos  = len(y_sol)//2
+            Xn    = np.abs(X[:Npos])/Npos
+            fp    = freqs[:Npos]
 
-            # FFT analysis
-            X = fft(y_sol)
-            freq_comp = fftfreq(len(y_sol), d=dt)
-            N = len(y_sol) // 2
-            X_abs = np.abs(X[:N])
-            X_norm = X_abs / N
-            freq_pos = freq_comp[:N]
+            peaks, _ = find_peaks(Xn)
+            peaks    = [p for p in peaks if fp[p]>0]
+            if len(peaks)>1:
+                peaks = [p for p in peaks if fp[p]>=400]
+            peak_idx = max(peaks, key=lambda p: Xn[p]) if peaks else np.argmax(Xn)
 
-            # find_peaks instead of argrelmax(…, np.greater)
-            peaks, _ = find_peaks(X_norm)
-            # filter out the zero‐frequency peak if needed
-            peaks = peaks[freq_pos[peaks] > 0]
-            if len(peaks) > 1:
-                peaks = peaks[freq_pos[peaks] >= 400]
-            if len(peaks) > 0:
-                peak_idx = peaks[np.argmax(X_norm[peaks])]
-            else:
-                peak_idx = np.argmax(X_norm)
-
-            TF_array[n] = X_norm[peak_idx]
-            Test_omega_array[n] = freq_pos[peak_idx]
+            TF_array[n]        = Xn[peak_idx]
+            Test_omega_array[n] = fp[peak_idx]
 
         amplitude_list.append(TF_array)
         frequency_list.append(Test_omega_array)
 
-        # Compute Q from first threshold width
-        thresholds = np.linspace(0.5, 0.99, 50)
-        widths = [float(Width(Test_omega_array, TF_array, th)) for th in thresholds]
-        Q_list.append(Test_omega_array[np.argmax(TF_array)] / widths[0])
+        # compute Q at half-height
+        Δω = Width(Test_omega_array, TF_array, 0.5)
+        ω_peak = Test_omega_array[np.argmax(TF_array)]
+        Q_list.append(ω_peak/Δω)
 
     # Write results once, after loops
     if i in (1, 4):
